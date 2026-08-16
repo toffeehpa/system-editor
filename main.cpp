@@ -24,6 +24,20 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QEvent>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QComboBox>
+#include <QLabel>
+#include <QFontDialog>
+#include <QFont>
+#include <QRadioButton>
+#include <QButtonGroup>
+#include <QTextCodec>
+#include <QStringDecoder>
+#include <QRegularExpression>
+#include <QTextBlock>
+#include <QTextFragment>
+#include <QTimer>
 #include <functional>
 
 class FindLineEdit : public QLineEdit
@@ -63,12 +77,364 @@ public:
 
     std::function<bool(const QMimeData *)> pasteInterceptor;
 
+    bool smartQuotesEnabled = false;
+    bool smartDashesEnabled = false;
+    bool smartLinksEnabled = false;
+
 protected:
     void insertFromMimeData(const QMimeData *source) override
     {
         if (pasteInterceptor && pasteInterceptor(source))
             return;
         QTextEdit::insertFromMimeData(source);
+    }
+
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (handleSmartTyping(event))
+            return;
+
+        QTextEdit::keyPressEvent(event);
+
+        const bool wordBoundary = (event->key() == Qt::Key_Space
+                                    || event->key() == Qt::Key_Return
+                                    || event->key() == Qt::Key_Enter);
+        if (smartLinksEnabled && acceptRichText() && wordBoundary)
+            linkifyPrecedingWord();
+    }
+
+private:
+    QChar charBeforeCursor() const
+    {
+        QTextCursor cursor = textCursor();
+        if (cursor.position() == 0)
+            return QChar();
+        cursor.movePosition(QTextCursor::PreviousCharacter, QTextCursor::KeepAnchor);
+        return cursor.selectedText().at(0);
+    }
+
+    bool blockContainsCyrillic() const
+    {
+        for (const QChar &ch : textCursor().block().text()) {
+            if (ch.unicode() >= 0x0400 && ch.unicode() <= 0x04FF)
+                return true;
+        }
+        return false;
+    }
+
+    bool handleSmartTyping(QKeyEvent *event)
+    {
+        if (smartQuotesEnabled && event->text() == "\"") {
+            if (!blockContainsCyrillic())
+                return false; // if text not russian then leave quotes straight
+
+            const QChar prev = charBeforeCursor();
+            const bool openingContext = prev.isNull() || prev.isSpace() || prev == QChar(0x00AB) /* « */;
+            textCursor().insertText(openingContext ? QString(QChar(0x00AB)) : QString(QChar(0x00BB)));
+            return true;
+        }
+
+        if (smartDashesEnabled && event->text() == "-") {
+            if (charBeforeCursor() == '-') {
+                QTextCursor cursor = textCursor();
+                cursor.movePosition(QTextCursor::PreviousCharacter, QTextCursor::KeepAnchor);
+                cursor.insertText(QString(QChar(0x2014))); // em dash sym —
+                return true;
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    void linkifyPrecedingWord()
+    {
+        QTextCursor cursor = textCursor();
+        const int endPos = cursor.position() - 1;
+        if (endPos <= 0)
+            return;
+
+        const QTextBlock block = cursor.block();
+        const QString blockText = block.text();
+        const int posInBlock = endPos - block.position();
+        if (posInBlock <= 0 || posInBlock > blockText.length())
+            return;
+
+        int start = posInBlock;
+        while (start > 0 && !blockText.at(start - 1).isSpace())
+            --start;
+
+        const QString word = blockText.mid(start, posInBlock - start);
+
+        static const QRegularExpression urlPattern(R"(^(https?://\S+|www\.\S+\.\S+)$)");
+        if (!urlPattern.match(word).hasMatch())
+            return;
+
+        QString href = word;
+        if (href.startsWith("www."))
+            href.prepend("https://");
+
+        QTextCursor linkCursor(document());
+        linkCursor.setPosition(block.position() + start);
+        linkCursor.setPosition(block.position() + posInBlock, QTextCursor::KeepAnchor);
+
+        QTextCharFormat linkFormat;
+        linkFormat.setAnchor(true);
+        linkFormat.setAnchorHref(href);
+        linkFormat.setForeground(QColor(0x1a, 0x73, 0xe8));
+        linkFormat.setFontUnderline(true);
+        linkCursor.mergeCharFormat(linkFormat);
+    }
+};
+
+class SettingsDialog : public QDialog
+{
+    Q_OBJECT
+public:
+    explicit SettingsDialog(QWidget *parent = nullptr) : QDialog(parent)
+    {
+        setWindowTitle("Preferences");
+
+        auto *layout = new QVBoxLayout(this);
+
+        autoAppendTxtCheck = new QCheckBox("Automatically append .txt when saving Plain Text");
+        layout->addWidget(autoAppendTxtCheck);
+
+        auto *encodingRow = new QHBoxLayout();
+        encodingRow->addWidget(new QLabel("Save Plain Text as:"));
+        encodingCombo = new QComboBox();
+        encodingCombo->addItems({"UTF-8", "UTF-16", "Windows-1251"});
+        encodingRow->addWidget(encodingCombo);
+        layout->addLayout(encodingRow);
+
+        layout->addWidget(new QLabel("Default mode for new windows:"));
+        modePlainRadio = new QRadioButton("Plain Text");
+        modeRichRadio = new QRadioButton("Rich Text");
+        auto *modeGroup = new QButtonGroup(this);
+        modeGroup->addButton(modePlainRadio);
+        modeGroup->addButton(modeRichRadio);
+        layout->addWidget(modePlainRadio);
+        layout->addWidget(modeRichRadio);
+
+        smartQuotesCheck = new QCheckBox("Smart quotes (\" \u2192 \u00ab \u00bb)");
+        layout->addWidget(smartQuotesCheck);
+
+        smartDashesCheck = new QCheckBox("Smart dashes (-- \u2192 \u2014)");
+        layout->addWidget(smartDashesCheck);
+
+        smartLinksCheck = new QCheckBox("Smart links (auto-detect URLs in Rich Text)");
+        layout->addWidget(smartLinksCheck);
+
+        auto *plainFontRow = new QHBoxLayout();
+        plainFontLabel = new QLabel();
+        auto *plainFontBtn = new QPushButton("Choose...");
+        connect(plainFontBtn, &QPushButton::clicked, this, &SettingsDialog::pickPlainFont);
+        plainFontRow->addWidget(plainFontLabel, 1);
+        plainFontRow->addWidget(plainFontBtn);
+        layout->addLayout(plainFontRow);
+
+        auto *richFontRow = new QHBoxLayout();
+        richFontLabel = new QLabel();
+        auto *richFontBtn = new QPushButton("Choose...");
+        connect(richFontBtn, &QPushButton::clicked, this, &SettingsDialog::pickRichFont);
+        richFontRow->addWidget(richFontLabel, 1);
+        richFontRow->addWidget(richFontBtn);
+        layout->addLayout(richFontRow);
+
+        auto *codeFontRow = new QHBoxLayout();
+        codeFontLabel = new QLabel();
+        auto *codeFontBtn = new QPushButton("Choose...");
+        connect(codeFontBtn, &QPushButton::clicked, this, &SettingsDialog::pickCodeFont);
+        codeFontRow->addWidget(codeFontLabel, 1);
+        codeFontRow->addWidget(codeFontBtn);
+        layout->addLayout(codeFontRow);
+
+        layout->addWidget(new QLabel("When pasting rich text into Plain Text:"));
+        pasteAskRadio = new QRadioButton("Ask every time");
+        pasteRichRadio = new QRadioButton("Always open in a Rich Text window");
+        pastePlainRadio = new QRadioButton("Always paste as plain text");
+        auto *pasteGroup = new QButtonGroup(this);
+        pasteGroup->addButton(pasteAskRadio);
+        pasteGroup->addButton(pasteRichRadio);
+        pasteGroup->addButton(pastePlainRadio);
+        layout->addWidget(pasteAskRadio);
+        layout->addWidget(pasteRichRadio);
+        layout->addWidget(pastePlainRadio);
+
+        auto *resetBtn = new QPushButton("Reset to Defaults");
+        connect(resetBtn, &QPushButton::clicked, this, &SettingsDialog::resetToDefaults);
+        layout->addWidget(resetBtn);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);
+        connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::close);
+        layout->addWidget(buttons);
+
+        loadFromSettings();
+
+        connect(autoAppendTxtCheck, &QCheckBox::toggled, this, [](bool v) {
+            QSettings s;
+            s.setValue("file/autoAppendTxtExtension", v);
+        });
+        connect(encodingCombo, &QComboBox::currentTextChanged, this, [](const QString &v) {
+            QSettings s;
+            s.setValue("file/saveEncoding", v);
+        });
+        connect(modeRichRadio, &QRadioButton::toggled, this, [](bool checked) {
+                    if (checked) {
+                        QSettings s;
+                        s.setValue("file/defaultMode", "rich");
+                    }
+                });
+        connect(modePlainRadio, &QRadioButton::toggled, this, [](bool checked) {
+            if (checked) {
+                QSettings s;
+                s.setValue("file/defaultMode", "plain");
+            }
+        });
+        connect(pasteAskRadio, &QRadioButton::toggled, this, [](bool checked) {
+            if (checked) { QSettings s; s.setValue("paste/richTextChoice", 0); }
+        });
+        connect(pasteRichRadio, &QRadioButton::toggled, this, [](bool checked) {
+            if (checked) { QSettings s; s.setValue("paste/richTextChoice", 1); }
+        });
+        connect(pastePlainRadio, &QRadioButton::toggled, this, [](bool checked) {
+            if (checked) { QSettings s; s.setValue("paste/richTextChoice", 2); }
+        });
+        connect(smartQuotesCheck, &QCheckBox::toggled, this, [](bool v) {
+                    QSettings s;
+                    s.setValue("typing/smartQuotes", v);
+                });
+        connect(smartDashesCheck, &QCheckBox::toggled, this, [](bool v) {
+            QSettings s;
+            s.setValue("typing/smartDashes", v);
+        });
+        connect(smartLinksCheck, &QCheckBox::toggled, this, [](bool v) {
+            QSettings s;
+            s.setValue("typing/smartLinks", v);
+        });
+        connect(smartQuotesCheck, &QCheckBox::toggled, this, [this](bool v) {
+            QSettings s;
+            s.setValue("typing/smartQuotes", v);
+            emit smartQuotesChanged(v);
+        });
+        connect(smartDashesCheck, &QCheckBox::toggled, this, [this](bool v) {
+            QSettings s;
+            s.setValue("typing/smartDashes", v);
+            emit smartDashesChanged(v);
+        });
+        connect(smartLinksCheck, &QCheckBox::toggled, this, [this](bool v) {
+            QSettings s;
+            s.setValue("typing/smartLinks", v);
+            emit smartLinksChanged(v);
+        });
+    }
+
+signals:
+    void smartQuotesChanged(bool enabled);
+    void smartDashesChanged(bool enabled);
+    void smartLinksChanged(bool enabled);
+
+private:
+    QCheckBox *autoAppendTxtCheck;
+    QComboBox *encodingCombo;
+    QRadioButton *modePlainRadio;
+    QRadioButton *modeRichRadio;
+    QCheckBox *smartQuotesCheck;
+    QCheckBox *smartDashesCheck;
+    QCheckBox *smartLinksCheck;
+    QLabel *plainFontLabel;
+    QLabel *richFontLabel;
+    QLabel *codeFontLabel;
+    QRadioButton *pasteAskRadio;
+    QRadioButton *pasteRichRadio;
+    QRadioButton *pastePlainRadio;
+
+    void loadFromSettings()
+    {
+        QSettings s;
+        autoAppendTxtCheck->setChecked(s.value("file/autoAppendTxtExtension", true).toBool());
+        encodingCombo->setCurrentText(s.value("file/saveEncoding", "UTF-8").toString());
+        if (s.value("file/defaultMode", "plain").toString() == "rich")
+            modeRichRadio->setChecked(true);
+        else
+            modePlainRadio->setChecked(true);
+
+        switch (s.value("paste/richTextChoice", 0).toInt()) {
+            case 1: pasteRichRadio->setChecked(true); break;
+            case 2: pastePlainRadio->setChecked(true); break;
+            default: pasteAskRadio->setChecked(true); break;
+        }
+        smartQuotesCheck->setChecked(s.value("typing/smartQuotes", true).toBool());
+        smartDashesCheck->setChecked(s.value("typing/smartDashes", true).toBool());
+        smartLinksCheck->setChecked(s.value("typing/smartLinks", true).toBool());
+        updateFontLabels();
+    }
+
+    void updateFontLabels()
+    {
+        QSettings s;
+        const QFont plainFont = s.value("fonts/plainText", QFont()).value<QFont>();
+        const QFont richFont = s.value("fonts/richText", QFont()).value<QFont>();
+        const QFont codeFont = s.value("fonts/code", QFont("monospace")).value<QFont>();
+        plainFontLabel->setText(QString("Plain Text: %1, %2pt").arg(plainFont.family()).arg(plainFont.pointSize()));
+        richFontLabel->setText(QString("Rich Text: %1, %2pt").arg(richFont.family()).arg(richFont.pointSize()));
+        codeFontLabel->setText(QString("Code: %1, %2pt").arg(codeFont.family()).arg(codeFont.pointSize()));
+    }
+
+    void pickPlainFont()
+    {
+        QSettings s;
+        bool ok = false;
+        const QFont chosen = QFontDialog::getFont(&ok, s.value("fonts/plainText", QFont()).value<QFont>(),
+                                                    this, "Choose Plain Text Font");
+        if (ok) {
+            s.setValue("fonts/plainText", chosen);
+            updateFontLabels();
+        }
+    }
+
+    void pickRichFont()
+    {
+        QSettings s;
+        bool ok = false;
+        const QFont chosen = QFontDialog::getFont(&ok, s.value("fonts/richText", QFont()).value<QFont>(),
+                                                    this, "Choose Rich Text Font");
+        if (ok) {
+            s.setValue("fonts/richText", chosen);
+            updateFontLabels();
+        }
+    }
+
+    void pickCodeFont()
+    {
+        QSettings s;
+        bool ok = false;
+        const QFont chosen = QFontDialog::getFont(&ok, s.value("fonts/code", QFont("monospace")).value<QFont>(),
+                                                    this, "Choose Code Font");
+        if (ok) {
+            s.setValue("fonts/code", chosen);
+            updateFontLabels();
+        }
+    }
+
+    void resetToDefaults()
+    {
+        QSettings s;
+        s.remove("file/autoAppendTxtExtension");
+        s.remove("file/saveEncoding");
+        s.remove("file/defaultMode");
+        s.remove("typing/smartQuotes");
+        s.remove("typing/smartDashes");
+        s.remove("typing/smartLinks");
+        s.remove("fonts/plainText");
+        s.remove("fonts/richText");
+        s.remove("fonts/code");
+        s.remove("paste/richTextChoice");
+        loadFromSettings();
+        emit smartQuotesChanged(true);
+        emit smartDashesChanged(true);
+        emit smartLinksChanged(true);
     }
 };
 
@@ -80,14 +446,20 @@ public:
     {
         editor = new RichAwareTextEdit(this);
         editor->pasteInterceptor = [this](const QMimeData *source) { return handleRichPaste(source); };
+        editor->smartQuotesEnabled = loadTypingSetting("typing/smartQuotes");
+        editor->smartDashesEnabled = loadTypingSetting("typing/smartDashes");
+        editor->smartLinksEnabled = loadTypingSetting("typing/smartLinks");
         applyRichTextMode(startRich);
+        applyFontForMode();
 
         findInput = new FindLineEdit(this);
         findBar = new QWidget(this);
+        findCountLabel = new QLabel(findBar);
 
         auto *findLayout = new QHBoxLayout(findBar);
         findLayout->setContentsMargins(4, 4, 4, 4);
         findLayout->addWidget(findInput);
+        findLayout->addWidget(findCountLabel);
         findBar->setVisible(false);
 
         menuBar = new QMenuBar(this);
@@ -117,9 +489,13 @@ private:
     RichAwareTextEdit *editor;
     QWidget *findBar;
     FindLineEdit *findInput;
+    QLabel *findCountLabel;
+    QList<QTextCursor> findMatches;
+    int findMatchIndex = -1;
     QAction *richTextAction = nullptr;
     QString currentFilePath;
     bool richTextMode = false;
+    bool isOtherFileType = false;
     QMenuBar *menuBar = nullptr;
     bool altTapCandidate = false;
 
@@ -175,6 +551,44 @@ private:
         richTextAction = formatMenu->addAction(richTextMode ? "Make &Plain Text" : "Make &Rich Text");
         addAction(richTextAction);
         connect(richTextAction, &QAction::triggered, this, &MainWidget::switchModeInNewWindow);
+
+        auto *settingsMenu = bar->addMenu("&Settings");
+        addMenuAction(settingsMenu, "&Preferences...", QKeySequence::Preferences, this, &MainWidget::openPreferences);
+    }
+
+    static bool loadTypingSetting(const QString &key)
+    {
+        QSettings settings;
+        return settings.value(key, true).toBool();
+    }
+
+    void applyFontForMode() const
+    {
+        QSettings settings;
+
+        if (isOtherFileType) {
+            editor->setFont(settings.value("fonts/code", QFont("monospace")).value<QFont>());
+            return;
+        }
+
+        const QString key = richTextMode ? "fonts/richText" : "fonts/plainText";
+        editor->setFont(settings.value(key, editor->font()).value<QFont>());
+    }
+
+    void openPreferences()
+    {
+        SettingsDialog dialog(this);
+        connect(&dialog, &SettingsDialog::smartQuotesChanged, this, [this](bool enabled) {
+            editor->smartQuotesEnabled = enabled;
+        });
+        connect(&dialog, &SettingsDialog::smartDashesChanged, this, [this](bool enabled) {
+            editor->smartDashesEnabled = enabled;
+        });
+        connect(&dialog, &SettingsDialog::smartLinksChanged, this, [this](bool enabled) {
+            editor->smartLinksEnabled = enabled;
+        });
+        dialog.exec();
+        applyFontForMode();
     }
 
     void connectFindBar()
@@ -238,11 +652,44 @@ private:
         settings.setValue("paste/richTextChoice", static_cast<int>(choice));
     }
 
+    static bool htmlHasRealFormatting(const QString &html)
+    {
+        QTextDocument doc;
+        doc.setHtml(html);
+
+        for (QTextBlock block = doc.begin(); block.isValid(); block = block.next()) {
+            if (block.textList())
+                return true;
+
+            for (auto it = block.begin(); !it.atEnd(); ++it) {
+                const QTextFragment fragment = it.fragment();
+                if (!fragment.isValid())
+                    continue;
+
+                const QTextCharFormat format = fragment.charFormat();
+                if (format.fontWeight() > QFont::Normal || format.fontItalic() || format.fontUnderline()
+                    || format.fontStrikeOut() || format.isAnchor())
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
     bool handleRichPaste(const QMimeData *source)
     {
-        if (richTextMode || !source->hasHtml())
+        if (richTextMode || !source->hasHtml() || !htmlHasRealFormatting(source->html()))
             return false;
 
+        const QString html = source->html();
+        const QString plain = source->text();
+        QTimer::singleShot(0, this, [this, html, plain] { promptRichPaste(html, plain); });
+
+        return true;
+    }
+
+    void promptRichPaste(const QString &html, const QString &plain)
+    {
         PasteChoice choice = loadRememberedPasteChoice();
         if (choice == PasteChoice::Ask) {
             QMessageBox box(this);
@@ -255,17 +702,16 @@ private:
             box.setCheckBox(rememberBox);
             box.exec();
 
-            choice = (box.clickedButton() == richBtn) ? PasteChoice::OpenRichWindow : PasteChoice::PasteAsPlain;
-            if (rememberBox->isChecked())
+            QAbstractButton *clicked = box.clickedButton();
+            choice = (clicked == richBtn) ? PasteChoice::OpenRichWindow : PasteChoice::PasteAsPlain;
+            if (clicked && rememberBox->isChecked())
                 saveRememberedPasteChoice(choice);
         }
 
         if (choice == PasteChoice::OpenRichWindow)
-            openWindowWithMode(true, source->html(), true);
+            openWindowWithMode(true, html, true);
         else
-            editor->insertPlainText(source->text());
-
-        return true;
+            editor->insertPlainText(plain);
     }
 
     void newDocument()
@@ -275,6 +721,8 @@ private:
 
         editor->clear();
         currentFilePath.clear();
+        isOtherFileType = false;
+        applyFontForMode();
         editor->document()->setModified(false);
         updateWindowTitle();
     }
@@ -299,11 +747,13 @@ private:
             return;
 
         QFile file(path);
-        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        if (!file.open(QIODevice::ReadOnly))
             return;
 
-        editor->setPlainText(QTextStream(&file).readAll());
+        editor->setPlainText(decodeFileContent(file.readAll()));
         currentFilePath = path;
+        isOtherFileType = (suffix != "txt");
+        applyFontForMode();
         editor->document()->setModified(false);
         updateWindowTitle();
     }
@@ -332,17 +782,51 @@ private:
         }
 
         QFile file(currentFilePath);
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        if (!file.open(QIODevice::WriteOnly))
             return;
 
-        QTextStream out(&file);
-        if (richTextMode)
+        if (richTextMode) {
+            QTextStream out(&file);
             out << editor->toHtml();
-        else
-            out << editor->toPlainText();
+        } else {
+            writePlainTextWithEncoding(file, editor->toPlainText());
+        }
 
         editor->document()->setModified(false);
         updateWindowTitle();
+    }
+
+    static void writePlainTextWithEncoding(QFile &file, const QString &text)
+    {
+        QSettings settings;
+        const QString encoding = settings.value("file/saveEncoding", "UTF-8").toString();
+
+        if (encoding == "Windows-1251") {
+            QTextCodec *codec = QTextCodec::codecForName("Windows-1251");
+            file.write(codec->fromUnicode(text));
+            return;
+        }
+
+        QTextStream out(&file);
+        out.setEncoding(encoding == "UTF-16" ? QStringConverter::Utf16 : QStringConverter::Utf8);
+        out << text;
+    }
+
+    // on open BOM first (covers all UTF) then fallbacks to UTF-8 and finally assumes Windows encoding
+    static QString decodeFileContent(const QByteArray &data)
+    {
+        if (const auto bomEncoding = QStringConverter::encodingForData(data)) {
+            QStringDecoder decoder(*bomEncoding);
+            return decoder(data);
+        }
+
+        QStringDecoder utf8Decoder(QStringConverter::Utf8);
+        const QString asUtf8 = utf8Decoder(data);
+        if (!utf8Decoder.hasError())
+            return asUtf8;
+
+        QTextCodec *codec = QTextCodec::codecForName("Windows-1251");
+        return codec->toUnicode(data);
     }
 
     void saveDocumentAs()
@@ -355,8 +839,12 @@ private:
         if (path.isEmpty())
             return;
 
-        if (QFileInfo(path).suffix().isEmpty())
-            path += richTextMode ? ".html" : ".txt";
+        if (QFileInfo(path).suffix().isEmpty()) {
+            QSettings settings;
+            const bool autoAppend = richTextMode || settings.value("file/autoAppendTxtExtension", true).toBool();
+            if (autoAppend)
+                path += richTextMode ? ".html" : ".txt";
+        }
 
         currentFilePath = path;
         saveDocument();
@@ -392,7 +880,7 @@ private:
             editor->print(&printer);
     }
 
-    void showFindBar()
+void showFindBar()
     {
         findBar->setVisible(true);
         findInput->setFocus();
@@ -400,59 +888,77 @@ private:
         updateHighlights();
     }
 
-    void hideFindBar() const
+    void hideFindBar()
     {
         findBar->setVisible(false);
+        findMatches.clear();
+        findMatchIndex = -1;
         editor->setExtraSelections({});
         editor->setFocus();
     }
 
-    void updateHighlights() const
+    void updateHighlights()
     {
-        QList<QTextEdit::ExtraSelection> selections;
-        const QString term = findInput->text();
+        findMatches.clear();
+        findMatchIndex = -1;
 
+        const QString term = findInput->text();
         if (!term.isEmpty()) {
             QTextCursor cursor(editor->document());
-            QTextCharFormat format;
-            format.setBackground(QColor(255, 235, 100));
-
             while (true) {
                 cursor = editor->document()->find(term, cursor);
                 if (cursor.isNull())
                     break;
-                QTextEdit::ExtraSelection sel;
-                sel.cursor = cursor;
-                sel.format = format;
-                selections.append(sel);
+                findMatches.append(cursor);
             }
         }
 
-        editor->setExtraSelections(selections);
+        if (!findMatches.isEmpty()) {
+            const int cursorPos = editor->textCursor().position();
+            findMatchIndex = 0;
+            for (int i = 0; i < findMatches.size(); ++i) {
+                if (findMatches.at(i).selectionStart() >= cursorPos) {
+                    findMatchIndex = i;
+                    break;
+                }
+            }
+        }
+
+        jumpToCurrentMatch();
+    }
+
+    void jumpToCurrentMatch()
+    {
+        if (findMatchIndex < 0 || findMatches.isEmpty()) {
+            editor->setExtraSelections({});
+            findCountLabel->setText(findInput->text().isEmpty() ? "" : "0/0");
+            return;
+        }
+
+        const QTextCursor &match = findMatches.at(findMatchIndex);
+        editor->setTextCursor(match);
+
+        QTextEdit::ExtraSelection sel;
+        sel.cursor = match;
+        sel.format.setBackground(QColor(255, 235, 100));
+        editor->setExtraSelections({sel});
+
+        findCountLabel->setText(QString("%1/%2").arg(findMatchIndex + 1).arg(findMatches.size()));
     }
 
     void findNext() { if (findBar->isVisible()) performSearch(true); else showFindBar(); }
     void findPrevious() { if (findBar->isVisible()) performSearch(false); else showFindBar(); }
 
-    void performSearch(bool forward) const
+    void performSearch(bool forward)
     {
-        const QString term = findInput->text();
-        if (term.isEmpty())
+        if (findMatches.isEmpty())
             return;
 
-        QTextDocument::FindFlags flags;
-        if (!forward)
-            flags |= QTextDocument::FindBackward;
+        findMatchIndex = forward
+            ? (findMatchIndex + 1) % findMatches.size()
+            : (findMatchIndex - 1 + findMatches.size()) % findMatches.size();
 
-        QTextCursor found = editor->document()->find(term, editor->textCursor(), flags);
-        if (found.isNull()) {
-            QTextCursor wrapPoint(editor->document());
-            if (!forward)
-                wrapPoint.movePosition(QTextCursor::End);
-            found = editor->document()->find(term, wrapPoint, flags);
-        }
-        if (!found.isNull())
-            editor->setTextCursor(found);
+        jumpToCurrentMatch();
     }
 
     void setShowInvisibles(bool enabled) const
@@ -508,8 +1014,11 @@ int main(int argc, char *argv[])
     QApplication::setOrganizationName("systemeditor");
     QApplication::setApplicationName("systemeditor");
 
-    MainWidget window;
-    window.resize(712, 420);
+    QSettings settings;
+    const bool startRich = settings.value("file/defaultMode", "plain").toString() == "rich";
+
+    MainWidget window(nullptr, startRich);
+    window.resize(684, 420);
     window.show();
 
     return app.exec();

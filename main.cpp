@@ -38,6 +38,12 @@
 #include <QTextBlock>
 #include <QTextFragment>
 #include <QTimer>
+#include <QRegularExpression>
+#include <QSyntaxHighlighter>
+#include <QProcess>
+#include <QBuffer>
+#include <QTableWidget>
+#include <QHeaderView>
 #include <functional>
 
 class FindLineEdit : public QLineEdit
@@ -80,6 +86,8 @@ public:
     bool smartQuotesEnabled = false;
     bool smartDashesEnabled = false;
     bool smartLinksEnabled = false;
+    bool textReplacementEnabled = false;
+    QList<QPair<QString, QString>> textReplacementRules;
 
 protected:
     void insertFromMimeData(const QMimeData *source) override
@@ -97,10 +105,13 @@ protected:
         QTextEdit::keyPressEvent(event);
 
         const bool wordBoundary = (event->key() == Qt::Key_Space
-                                    || event->key() == Qt::Key_Return
-                                    || event->key() == Qt::Key_Enter);
-        if (smartLinksEnabled && acceptRichText() && wordBoundary)
-            linkifyPrecedingWord();
+                                            || event->key() == Qt::Key_Return
+                                            || event->key() == Qt::Key_Enter);
+        if (wordBoundary) {
+            applyTextReplacement();
+            if (smartLinksEnabled && acceptRichText())
+                linkifyPrecedingWord();
+        }
     }
 
 private:
@@ -184,6 +195,39 @@ private:
         linkFormat.setForeground(QColor(0x1a, 0x73, 0xe8));
         linkFormat.setFontUnderline(true);
         linkCursor.mergeCharFormat(linkFormat);
+    }
+
+    void applyTextReplacement()
+    {
+        if (!textReplacementEnabled || textReplacementRules.isEmpty())
+            return;
+
+        QTextCursor cursor = textCursor();
+        const int endPos = cursor.position() - 1;
+        if (endPos <= 0)
+            return;
+
+        const QTextBlock block = cursor.block();
+        const QString blockText = block.text();
+        const int posInBlock = endPos - block.position();
+        if (posInBlock <= 0 || posInBlock > blockText.length())
+            return;
+
+        int start = posInBlock;
+        while (start > 0 && !blockText.at(start - 1).isSpace())
+            --start;
+
+        const QString word = blockText.mid(start, posInBlock - start);
+
+        for (const auto &rule : textReplacementRules) {
+            if (word.compare(rule.first, Qt::CaseInsensitive) == 0) {
+                QTextCursor replaceCursor(document());
+                replaceCursor.setPosition(block.position() + start);
+                replaceCursor.setPosition(block.position() + posInBlock, QTextCursor::KeepAnchor);
+                replaceCursor.insertText(rule.second);
+                return;
+            }
+        }
     }
 };
 
@@ -438,6 +482,117 @@ private:
     }
 };
 
+class ConfigHighlighter : public QSyntaxHighlighter
+{
+    Q_OBJECT
+public:
+    using QSyntaxHighlighter::QSyntaxHighlighter;
+
+protected:
+    void highlightBlock(const QString &text) override
+    {
+        static const QRegularExpression keyPattern(R"(^\s*([A-Za-z0-9_.\-]+)\s*[:=])");
+        static const QRegularExpression commentPattern(R"(#.*$)");
+
+        const auto keyMatch = keyPattern.match(text);
+        if (keyMatch.hasMatch()) {
+            QTextCharFormat keyFormat;
+            keyFormat.setForeground(QColor(0x4a, 0x86, 0xc8));
+            keyFormat.setFontWeight(QFont::Bold);
+            setFormat(keyMatch.capturedStart(1), keyMatch.capturedLength(1), keyFormat);
+        }
+
+        const auto commentMatch = commentPattern.match(text);
+        if (commentMatch.hasMatch()) {
+            QTextCharFormat commentFormat;
+            commentFormat.setForeground(QColor(0x6a, 0x99, 0x55));
+            setFormat(commentMatch.capturedStart(), commentMatch.capturedLength(), commentFormat);
+        }
+    }
+};
+
+class TextReplacementsDialog : public QDialog
+{
+    Q_OBJECT
+public:
+    explicit TextReplacementsDialog(QWidget *parent = nullptr) : QDialog(parent)
+    {
+        setWindowTitle("Text Replacements");
+        resize(400, 300);
+
+        table = new QTableWidget(0, 2, this);
+        table->setHorizontalHeaderLabels({"Replace", "With"});
+        table->horizontalHeader()->setStretchLastSection(true);
+
+        auto *addBtn = new QPushButton("Add");
+        auto *removeBtn = new QPushButton("Remove");
+        connect(addBtn, &QPushButton::clicked, this, [this] { table->insertRow(table->rowCount()); });
+        connect(removeBtn, &QPushButton::clicked, this, [this] {
+            const auto rows = table->selectionModel()->selectedRows();
+            for (auto it = rows.rbegin(); it != rows.rend(); ++it)
+                table->removeRow(it->row());
+        });
+
+        auto *btnRow = new QHBoxLayout();
+        btnRow->addWidget(addBtn);
+        btnRow->addWidget(removeBtn);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);
+        connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::close);
+
+        auto *layout = new QVBoxLayout(this);
+        layout->addWidget(table);
+        layout->addLayout(btnRow);
+        layout->addWidget(buttons);
+
+        loadRules();
+        connect(table, &QTableWidget::cellChanged, this, &TextReplacementsDialog::saveRules);
+    }
+
+signals:
+    void rulesChanged();
+
+private:
+    QTableWidget *table;
+
+    void loadRules()
+    {
+        table->blockSignals(true);
+        table->setRowCount(0);
+        QSettings settings;
+        const int size = settings.beginReadArray("textReplacements");
+        for (int i = 0; i < size; ++i) {
+            settings.setArrayIndex(i);
+            const int row = table->rowCount();
+            table->insertRow(row);
+            table->setItem(row, 0, new QTableWidgetItem(settings.value("from").toString()));
+            table->setItem(row, 1, new QTableWidgetItem(settings.value("to").toString()));
+        }
+        settings.endArray();
+        table->blockSignals(false);
+    }
+
+    void saveRules()
+    {
+        QSettings settings;
+        settings.beginWriteArray("textReplacements");
+        int index = 0;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const QTableWidgetItem *fromItem = table->item(row, 0);
+            const QString from = fromItem ? fromItem->text() : QString();
+            if (from.isEmpty())
+                continue;
+            const QTableWidgetItem *toItem = table->item(row, 1);
+            settings.setArrayIndex(index++);
+            settings.setValue("from", from);
+            settings.setValue("to", toItem ? toItem->text() : QString());
+        }
+        settings.endArray();
+        emit rulesChanged();
+    }
+};
+
 class MainWidget : public QWidget
 {
     Q_OBJECT
@@ -446,9 +601,8 @@ public:
     {
         editor = new RichAwareTextEdit(this);
         editor->pasteInterceptor = [this](const QMimeData *source) { return handleRichPaste(source); };
-        editor->smartQuotesEnabled = loadTypingSetting("typing/smartQuotes");
-        editor->smartDashesEnabled = loadTypingSetting("typing/smartDashes");
-        editor->smartLinksEnabled = loadTypingSetting("typing/smartLinks");
+        applySmartTypingSettings();
+        applyHighlighterForMode();
         applyRichTextMode(startRich);
         applyFontForMode();
 
@@ -496,6 +650,7 @@ private:
     QString currentFilePath;
     bool richTextMode = false;
     bool isOtherFileType = false;
+    ConfigHighlighter *configHighlighter = nullptr;
     QMenuBar *menuBar = nullptr;
     bool altTapCandidate = false;
 
@@ -548,6 +703,18 @@ private:
         connect(showInvisiblesAction, &QAction::toggled, this, &MainWidget::setShowInvisibles);
 
         formatMenu->addSeparator();
+        auto *replacementsAction = formatMenu->addAction("Text &Replacements...");
+        addAction(replacementsAction);
+        connect(replacementsAction, &QAction::triggered, this, [this] {
+            auto *dialog = new TextReplacementsDialog(this);
+            connect(dialog, &TextReplacementsDialog::rulesChanged, this, [this] {
+                editor->textReplacementRules = loadTextReplacementRules();
+            });
+            dialog->setAttribute(Qt::WA_DeleteOnClose);
+            dialog->show();
+        });
+
+        formatMenu->addSeparator();
         richTextAction = formatMenu->addAction(richTextMode ? "Make &Plain Text" : "Make &Rich Text");
         addAction(richTextAction);
         connect(richTextAction, &QAction::triggered, this, &MainWidget::switchModeInNewWindow);
@@ -562,6 +729,19 @@ private:
         return settings.value(key, true).toBool();
     }
 
+    static QList<QPair<QString, QString>> loadTextReplacementRules()
+    {
+        QSettings settings;
+        QList<QPair<QString, QString>> rules;
+        const int size = settings.beginReadArray("textReplacements");
+        for (int i = 0; i < size; ++i) {
+            settings.setArrayIndex(i);
+            rules.append({settings.value("from").toString(), settings.value("to").toString()});
+        }
+        settings.endArray();
+        return rules;
+    }
+
     void applyFontForMode() const
     {
         QSettings settings;
@@ -573,6 +753,31 @@ private:
 
         const QString key = richTextMode ? "fonts/richText" : "fonts/plainText";
         editor->setFont(settings.value(key, editor->font()).value<QFont>());
+    }
+
+    // in code mode there is not smart stuff enabled for this mode
+    void applySmartTypingSettings() const
+    {
+        if (isOtherFileType) {
+            editor->smartQuotesEnabled = false;
+            editor->smartDashesEnabled = false;
+            editor->smartLinksEnabled = false;
+            editor->textReplacementEnabled = false;
+            return;
+        }
+
+        editor->smartQuotesEnabled = loadTypingSetting("typing/smartQuotes");
+        editor->smartDashesEnabled = loadTypingSetting("typing/smartDashes");
+        editor->smartLinksEnabled = loadTypingSetting("typing/smartLinks");
+        editor->textReplacementEnabled = true;
+        editor->textReplacementRules = loadTextReplacementRules();
+    }
+
+    void applyHighlighterForMode()
+    {
+        if (!configHighlighter)
+            configHighlighter = new ConfigHighlighter(editor->document());
+        configHighlighter->setDocument(isOtherFileType ? editor->document() : nullptr);
     }
 
     void openPreferences()
@@ -723,6 +928,25 @@ private:
         currentFilePath.clear();
         isOtherFileType = false;
         applyFontForMode();
+        applySmartTypingSettings();
+        applyHighlighterForMode();
+        editor->document()->setModified(false);
+        updateWindowTitle();
+    }
+
+public:
+    void openExternalFile(const QString &path, bool otherFileType)
+    {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly))
+            return;
+
+        editor->setPlainText(decodeFileContent(file.readAll()));
+        currentFilePath = path;
+        isOtherFileType = otherFileType;
+        applyFontForMode();
+        applySmartTypingSettings();
+        applyHighlighterForMode();
         editor->document()->setModified(false);
         updateWindowTitle();
     }
@@ -736,10 +960,9 @@ private:
             return;
 
         const QString suffix = QFileInfo(path).suffix().toLower();
-        const bool rich = (suffix == "html" || suffix == "htm");
 
-        if (rich) {
-            openFileInNewWindow(path);
+        if (suffix == "html" || suffix == "htm") {
+            openHtmlFileInNewWindow(path);
             return;
         }
 
@@ -754,19 +977,41 @@ private:
         currentFilePath = path;
         isOtherFileType = (suffix != "txt");
         applyFontForMode();
+        applySmartTypingSettings();
         editor->document()->setModified(false);
         updateWindowTitle();
     }
 
-    void openFileInNewWindow(const QString &path)
+    // with <!DOCTYPE HTML> user declares about code mode
+    static bool containsHtmlDoctype(const QString &text)
+    {
+        static const QRegularExpression doctypePattern(
+            R"(<!doctype\s+html)", QRegularExpression::CaseInsensitiveOption);
+        return doctypePattern.match(text.left(1000)).hasMatch();
+    }
+
+public:
+    static void openHtmlFileInNewWindow(const QString &path)
     {
         QFile file(path);
-        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        if (!file.open(QIODevice::ReadOnly))
             return;
 
-        auto *newWindow = new MainWidget(nullptr, true);
+        const QString content = decodeFileContent(file.readAll());
+        const bool asCode = containsHtmlDoctype(content);
+
+        auto *newWindow = new MainWidget(nullptr, !asCode);
         newWindow->setAttribute(Qt::WA_DeleteOnClose);
-        newWindow->editor->setHtml(QTextStream(&file).readAll());
+        newWindow->isOtherFileType = asCode;
+        newWindow->applyFontForMode();
+        newWindow->applySmartTypingSettings();
+        newWindow->applyHighlighterForMode();
+
+        if (asCode)
+            newWindow->editor->setPlainText(content);
+        else
+            newWindow->editor->setHtml(content);
+
         newWindow->currentFilePath = path;
         newWindow->editor->document()->setModified(false);
         newWindow->updateWindowTitle();
@@ -774,42 +1019,82 @@ private:
         newWindow->show();
     }
 
-    void saveDocument()
+void saveDocument()
     {
         if (currentFilePath.isEmpty()) {
             saveDocumentAs();
             return;
         }
 
-        QFile file(currentFilePath);
-        if (!file.open(QIODevice::WriteOnly))
-            return;
+        const QByteArray content = richTextMode
+            ? editor->toHtml().toUtf8()
+            : encodePlainText(editor->toPlainText());
 
-        if (richTextMode) {
-            QTextStream out(&file);
-            out << editor->toHtml();
-        } else {
-            writePlainTextWithEncoding(file, editor->toPlainText());
+        QFile file(currentFilePath);
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(content);
+            editor->document()->setModified(false);
+            updateWindowTitle();
+            return;
         }
 
-        editor->document()->setModified(false);
-        updateWindowTitle();
+        if (file.error() != QFile::PermissionsError)
+            return;
+
+        if (!offerPrivilegedSave())
+            return;
+
+        if (writeWithPrivileges(currentFilePath, content)) {
+            editor->document()->setModified(false);
+            updateWindowTitle();
+        } else {
+            QMessageBox::warning(this, "Save Failed",
+                                  "Could not save the file, even with elevated privileges.");
+        }
     }
 
-    static void writePlainTextWithEncoding(QFile &file, const QString &text)
+    static QByteArray encodePlainText(const QString &text)
     {
         QSettings settings;
         const QString encoding = settings.value("file/saveEncoding", "UTF-8").toString();
 
         if (encoding == "Windows-1251") {
             QTextCodec *codec = QTextCodec::codecForName("Windows-1251");
-            file.write(codec->fromUnicode(text));
-            return;
+            return codec->fromUnicode(text);
         }
 
-        QTextStream out(&file);
+        QByteArray bytes;
+        QBuffer buffer(&bytes);
+        buffer.open(QIODevice::WriteOnly);
+        QTextStream out(&buffer);
         out.setEncoding(encoding == "UTF-16" ? QStringConverter::Utf16 : QStringConverter::Utf8);
         out << text;
+        out.flush();
+        return bytes;
+    }
+
+    bool offerPrivilegedSave()
+    {
+        const auto choice = QMessageBox::warning(
+            this, "Permission Denied",
+            "You don't have write access to this file. Try saving with elevated privileges?",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+        return choice == QMessageBox::Yes;
+    }
+
+    // Delegates to pkexec
+    static bool writeWithPrivileges(const QString &path, const QByteArray &content)
+    {
+        QProcess proc;
+        proc.start("pkexec", {"tee", path});
+        if (!proc.waitForStarted())
+            return false;
+
+        proc.write(content);
+        proc.closeWriteChannel();
+        proc.waitForFinished(-1);
+
+        return proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0;
     }
 
     // on open BOM first (covers all UTF) then fallbacks to UTF-8 and finally assumes Windows encoding
@@ -1011,15 +1296,37 @@ protected:
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
-    QApplication::setOrganizationName("systemeditor");
-    QApplication::setApplicationName("systemeditor");
+    QApplication::setOrganizationName("system-editor");
+    QApplication::setApplicationName("system-editor");
 
-    QSettings settings;
-    const bool startRich = settings.value("file/defaultMode", "plain").toString() == "rich";
+    const QStringList args = QApplication::arguments();
 
-    MainWidget window(nullptr, startRich);
-    window.resize(684, 420);
-    window.show();
+    if (args.size() > 1) {
+        const QString path = args.at(1);
+        const QString suffix = QFileInfo(path).suffix().toLower();
 
+        if (suffix == "html" || suffix == "htm") {
+            MainWidget::openHtmlFileInNewWindow(path);
+        } else {
+            QFile file(path);
+            if (file.open(QIODevice::ReadOnly)) {
+                QSettings settings;
+                const bool startRich = settings.value("file/defaultMode", "plain").toString() == "rich";
+
+                auto *window = new MainWidget(nullptr, startRich);
+                window->setAttribute(Qt::WA_DeleteOnClose);
+                window->openExternalFile(path, suffix != "txt");
+                window->resize(684, 420);
+                window->show();
+            }
+        }
+    } else {
+        QSettings settings;
+        const bool startRich = settings.value("file/defaultMode", "plain").toString() == "rich";
+        auto *window = new MainWidget(nullptr, startRich);
+        window->setAttribute(Qt::WA_DeleteOnClose);
+        window->resize(712, 420);
+        window->show();
+    }
     return app.exec();
 }

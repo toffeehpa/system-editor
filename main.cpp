@@ -654,9 +654,9 @@ private:
     QMenuBar *menuBar = nullptr;
     bool altTapCandidate = false;
 
-    template <typename Func>
+    template <typename Context, typename Func>
     QAction *addMenuAction(QMenu *menu, const QString &text, const QKeySequence &shortcut,
-                            QObject *context, Func slot)
+                            Context *context, Func slot)
     {
         QAction *action = menu->addAction(text);
         action->setShortcut(shortcut);

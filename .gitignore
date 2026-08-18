@@ -46,6 +46,7 @@ build-*/
 
 # CMake generated files
 CMakeFiles/
+cmake-build-*/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
@@ -70,3 +71,11 @@ Testing/
 
 # CLion
 .idea
+
+# Packaging artifacts (makepkg / CPack)
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.deb
+*.tar.gz

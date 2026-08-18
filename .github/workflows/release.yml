@@ -5,23 +5,30 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build-deb:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y qt6-base-dev qt6-5compat-dev libqt6printsupport6 cmake build-essential
+
       - name: Build
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build
+
       - name: Package .deb
         run: |
           cd build
           cpack -G DEB
+
       - uses: actions/upload-artifact@v4
         with:
           name: deb-package
@@ -35,13 +42,16 @@ jobs:
         run: |
           pacman -Syu --noconfirm base-devel qt6-base qt6-5compat cmake git sudo
           useradd -m builder
+
       - uses: actions/checkout@v4
+
       - name: Build PKGBUILD
         run: |
           chown -R builder:builder .
           cp packaging/arch/PKGBUILD .
           sed -i "s/^pkgver=.*/pkgver=${GITHUB_REF_NAME#v}/" PKGBUILD
           sudo -u builder makepkg -f --nocheck
+
       - uses: actions/upload-artifact@v4
         with:
           name: arch-package
@@ -52,6 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

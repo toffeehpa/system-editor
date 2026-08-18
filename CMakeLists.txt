@@ -11,6 +11,8 @@ add_executable(system-editor main.cpp)
 target_link_libraries(system-editor PRIVATE Qt6::Widgets Qt6::PrintSupport Qt6::Core5Compat)
 
 install(TARGETS system-editor RUNTIME DESTINATION bin)
+install(FILES packaging/arch/system-editor.desktop
+        DESTINATION share/applications)
 
 # --- CPack (Debian .deb) ---
 set(CPACK_PACKAGE_NAME "system-editor")
